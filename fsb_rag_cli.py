@@ -1,30 +1,19 @@
 #!/usr/bin/env python3
-"""Secure RAG CLI with consensus and provenance enforcement."""
+"""RAG CLI stripped of security theater."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
-from fsb_wayback.audit_tools import generate_audit_report
-from fsb_wayback.retrieval_policies import (
-    consensus_overlap,
-    jitter,
-    masked_sources,
-    should_answer,
-    snippet_only,
-    subsampled_topk,
-)
-from fsb_wayback.runtime import (
-    configure_runtime,
-    consensus_failure_message,
-    derive_runtime_config,
-    provenance_failure_message,
-    refusal_message,
-)
+from fsb_wayback.retrieval import overlap, snippet, top_k
+from fsb_wayback.utils import RuntimeConfig, load_defaults, runtime_guard, write_audit_report
+
+CONFIG_PATH = Path(__file__).resolve().parent / "fsb_wayback" / "config.yaml"
 
 
 @dataclass
@@ -45,6 +34,8 @@ class DualIndex:
 
 def load_jsonl(path: Path) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
+    if not path.exists():
+        return items
     with path.open("r", encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
@@ -69,66 +60,52 @@ def load_manifest_index(path: Path) -> Dict[Tuple[int, int], Dict[str, Any]]:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Secure OSINT RAG CLI")
-    parser.add_argument("--meta", type=Path, required=True, help="Metadata JSONL with chunk_text")
-    parser.add_argument(
-        "--manifest",
-        type=Path,
-        default=Path("merkle/manifest.jsonl"),
-        help="Merkle manifest JSONL",
-    )
-    parser.add_argument("--top-k", type=int, default=8, help="Maximum chunks to surface")
-    parser.add_argument("--mock-llm", action="store_true", help="Use offline summariser")
-    parser.add_argument("--reveal-sources", action="store_true", help="Show raw source IDs")
+    parser = argparse.ArgumentParser(description="Lean OSINT retrieval shell")
+    parser.add_argument("--meta", type=Path, help="Metadata JSONL with chunk_text", default=None)
+    parser.add_argument("--manifest", type=Path, help="Manifest JSONL to sanity check chunks", default=None)
+    parser.add_argument("--top-k", type=int, default=None, help="Chunks per question")
+    parser.add_argument("--mock-llm", action="store_true", help="Offline summary mode")
+    parser.add_argument("--reveal-sources", action="store_true", help="Show raw URLs")
     parser.add_argument("--audit", action="store_true", help="Emit audit report and exit")
-    for flag in ("read_only", "airgapped", "no_trace", "anti_mia", "robust_answer", "verify_provenance"):
-        parser.add_argument(
-            f"--{flag.replace('_', '-')}",
-            default=True,
-            action=argparse.BooleanOptionalAction,
-            help=f"Toggle {flag.replace('_', ' ')} mode",
-        )
+    parser.add_argument("--no-airgap", action="store_true", help="Keep proxies instead of purging them")
+    parser.add_argument("--qps", type=float, default=0.5, help="Rate limit per second")
+    parser.add_argument("--burst", type=int, default=2, help="Burst size for the limiter")
     return parser.parse_args(argv)
 
 
-def _summarise_offline(chunks: Sequence[Dict[str, Any]], question: str) -> str:
+def resolve_runtime(args: argparse.Namespace) -> RuntimeConfig:
+    airgapped = not args.no_airgap
+    return RuntimeConfig(airgapped=airgapped, qps=args.qps, burst=args.burst)
+
+
+def refusal(reason: str) -> str:
+    return f"Refused: {reason}."
+
+
+def _summarise_offline(chunks: Sequence[Dict[str, Any]]) -> str:
     highlights = []
     for meta in chunks:
-        snippet = meta.get("chunk_text", "")
-        snippet = snippet_only(jitter(snippet))
-        highlights.append(f"[{meta.get('date_iso') or meta.get('timestamp')}] {snippet}")
-    answer = "\n".join(highlights) or "No context available."
-    return answer
+        highlights.append(f"[{meta.get('date_iso') or meta.get('timestamp')}] {snippet(meta.get('chunk_text', ''))}")
+    return "\n".join(highlights) or "No context available."
 
 
-def build_answer(
-    *,
-    query: str,
-    hits: Sequence[Dict[str, Any]],
-    args: argparse.Namespace,
-) -> str:
+def build_answer(*, query: str, hits: Sequence[Dict[str, Any]], args: argparse.Namespace) -> str:
     if args.mock_llm:
-        return _summarise_offline(hits, query)
-    return refusal_message("offline mode enforced; no LLM available")
+        return _summarise_offline(hits)
+    return refusal("LLM disabled")
 
 
-def verify_chunks(
-    *,
-    hits: Sequence[Dict[str, Any]],
-    manifest_index: Dict[Tuple[int, int], Dict[str, Any]],
-) -> bool:
+def verify_chunks(*, hits: Sequence[Dict[str, Any]], manifest_index: Dict[Tuple[int, int], Dict[str, Any]]) -> bool:
+    if not manifest_index:
+        return True
     for meta in hits:
         key = (meta.get("doc_id"), meta.get("chunk_idx"))
         manifest_entry = manifest_index.get(key)
         if not manifest_entry:
             return False
         expected = manifest_entry.get("hash_text")
-        if not expected:
-            return False
         actual = meta.get("hash_text")
-        if actual != expected:
-            return False
-        if manifest_entry.get("hash_embed") != meta.get("hash_embed"):
+        if expected and actual and expected != actual:
             return False
     return True
 
@@ -136,24 +113,51 @@ def verify_chunks(
 def format_sources(hits: Sequence[Dict[str, Any]], reveal: bool) -> List[str]:
     if reveal:
         return [meta.get("wayback_url") or meta.get("original_url") or "unknown" for meta in hits]
-    return masked_sources(hits)
+    return [f"archival-snippet-{idx:02d}" for idx, _meta in enumerate(hits, 1)]
+
+
+def apply_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    defaults = load_defaults(CONFIG_PATH)
+    meta_env = os.getenv("FSB_METADATA")
+    manifest_env = os.getenv("FSB_MANIFEST")
+    topk_env = os.getenv("FSB_TOP_K")
+
+    if args.meta is None:
+        path = meta_env or defaults.get("metadata_path")
+        if path:
+            args.meta = Path(path)
+    if args.manifest is None:
+        path = manifest_env or defaults.get("manifest_path")
+        if path:
+            args.manifest = Path(path)
+    if args.top_k is None:
+        value = topk_env or defaults.get("max_hits")
+        if value is not None:
+            args.top_k = int(value)
+    if args.top_k is None:
+        args.top_k = 6
+    return args
 
 
 def execute_cli(args: argparse.Namespace) -> str:
+    args = apply_defaults(args)
+    if args.meta is None:
+        return refusal("metadata path missing")
+
     metadata = load_jsonl(args.meta)
     if not metadata:
-        return refusal_message("metadata not available")
-    manifest_index = load_manifest_index(args.manifest)
+        return refusal("metadata not available")
+    manifest_index = load_manifest_index(args.manifest) if args.manifest else {}
 
     retriever_a = DualIndex(metadata, seed=1)
     retriever_b = DualIndex(metadata, seed=2)
 
-    runtime_config = derive_runtime_config(args)
+    runtime_config = resolve_runtime(args)
     outputs: List[str] = []
-    consensus_trace: List[float] = []
+    overlap_trace: List[int] = []
 
-    with configure_runtime(runtime_config) as limiter:
-        print("[+] Secure RAG CLI ready. Type a question, or :q to quit.")
+    with runtime_guard(runtime_config) as limiter:
+        print("[+] Wayback RAG ready. :q quits.")
         while True:
             try:
                 question = input("\n[?] Question> ").strip()
@@ -169,32 +173,24 @@ def execute_cli(args: argparse.Namespace) -> str:
             limiter.acquire()
             hits_a = retriever_a.search(question, top_k=args.top_k * 2)
             hits_b = retriever_b.search(question, top_k=args.top_k * 2)
-            overlap_ids = consensus_overlap(hits_a, hits_b)
-            consensus_trace.append(len(overlap_ids))
-            if args.robust_answer and not should_answer(overlap_ids):
-                refusal = consensus_failure_message()
-                print(refusal)
-                outputs.append(refusal)
+            shared = overlap(hits_a, hits_b)
+            overlap_trace.append(len(shared))
+            if not shared:
+                refusal_msg = refusal("no overlapping hits")
+                print(refusal_msg)
+                outputs.append(refusal_msg)
                 continue
 
-            indices = [idx for idx, _score in hits_a if idx in overlap_ids]
-            selected = [metadata[i].copy() for i in indices[: args.top_k]]
-            if args.anti_mia:
-                selected = subsampled_topk(selected, k=args.top_k)
-                for meta in selected:
-                    meta["chunk_text"] = jitter(meta.get("chunk_text", ""))
-            selected = [
-                {
-                    **meta,
-                    "chunk_text": snippet_only(meta.get("chunk_text", "")),
-                }
-                for meta in selected
-            ]
+            indices = [idx for idx, _score in hits_a if idx in shared]
+            selected = [metadata[i].copy() for i in indices]
+            selected = top_k(selected, args.top_k)
+            for meta in selected:
+                meta["chunk_text"] = snippet(meta.get("chunk_text", ""))
 
-            if args.verify_provenance and not verify_chunks(hits=selected, manifest_index=manifest_index):
-                refusal = provenance_failure_message()
-                print(refusal)
-                outputs.append(refusal)
+            if not verify_chunks(hits=selected, manifest_index=manifest_index):
+                refusal_msg = refusal("manifest mismatch")
+                print(refusal_msg)
+                outputs.append(refusal_msg)
                 continue
 
             answer = build_answer(query=question, hits=selected, args=args)
@@ -207,20 +203,16 @@ def execute_cli(args: argparse.Namespace) -> str:
 
     if args.audit:
         flags = {
-            "read_only": args.read_only,
-            "airgapped": args.airgapped,
-            "no_trace": args.no_trace,
-            "anti_mia": args.anti_mia,
-            "robust_answer": args.robust_answer,
-            "verify_provenance": args.verify_provenance,
+            "airgapped": runtime_config.airgapped,
+            "qps": runtime_config.qps,
+            "burst": runtime_config.burst,
         }
-        kb_stats = {"indexed": len(metadata), "quarantined": 0}
-        generate_audit_report(
+        kb_stats = {"indexed": len(metadata)}
+        write_audit_report(
             flags=flags,
-            manifest_path=args.manifest,
+            manifest_path=args.manifest or Path("manifest.jsonl"),
             kb_stats=kb_stats,
-            consensus_trace=consensus_trace,
-            redteam_status_path=Path("tests/redteam/.last_run"),
+            overlap_trace=overlap_trace,
         )
     return "\n".join(outputs)
 

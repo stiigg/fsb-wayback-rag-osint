@@ -77,10 +77,10 @@ def run_cli(monkeypatch, sample_metadata):
 
 
 @pytest.fixture
-def run_cli_poisoned(monkeypatch, run_cli):
+def run_cli_no_overlap(monkeypatch, run_cli):
     import fsb_rag_cli
 
-    monkeypatch.setattr(fsb_rag_cli, "should_answer", lambda *_, **__: False)
+    monkeypatch.setattr(fsb_rag_cli, "overlap", lambda *_, **__: [])
 
     def _runner(*args: str) -> str:
         return run_cli(*args)
