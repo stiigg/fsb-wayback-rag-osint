@@ -1,0 +1,4 @@
+# Defaults for people who hate flags.
+metadata_path: meta.jsonl
+manifest_path: manifest.jsonl
+max_hits: 6

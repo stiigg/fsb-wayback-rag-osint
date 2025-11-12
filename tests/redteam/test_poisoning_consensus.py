@@ -1,6 +1,6 @@
 from __future__ import annotations
 
 
-def test_poison_triggers_refusal(run_cli_poisoned):
-    out = run_cli_poisoned("What is policy Y?")
-    assert "insufficient cross-index consensus" in out.lower()
+def test_no_overlap_refuses(run_cli_no_overlap):
+    out = run_cli_no_overlap("What is policy Y?")
+    assert "no overlapping hits" in out.lower()

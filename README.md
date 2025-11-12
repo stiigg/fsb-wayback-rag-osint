@@ -1,89 +1,30 @@
-# FSB RAG CLI
+# FSB Wayback RAG (No Bullshit Edition)
 
-This is a minimal Retrieval-Augmented Generation (RAG) stack on top of your
-Wayback/FSB archive JSONL (e.g. the output of your `fsb_wayback_scraper.py`
-and optional diff layer).
+This repo is now a blunt OSINT helper: load a metadata JSONL, clip overlapping hits, spit out snippets, and move on.
 
-## Files
+## Layout
+- `fsb_wayback/utils.py` – runtime throttle + audit dump in one angry file.
+- `fsb_wayback/retrieval.py` – top-k, snippet trimming, overlap math. Nothing else.
+- `fsb_wayback/config.yaml` – default paths for people who forget flags.
+- `fsb_rag_cli.py` – interactive shell that refuses nonsense instead of role-playing a SOC.
+- `tests/` – sanity checks proving the slimmed logic still works.
 
-- `fsb_build_index.py` – builds a FAISS vector index + metadata from a JSONL archive.
-- `fsb_rag_cli.py` – interactive CLI to query the archive using an LLM with RAG.
-- `requirements.txt` – Python dependencies.
-
-## Prerequisites
-
-- Python 3.9+
-- A JSONL file with one snapshot per line, containing at least:
-  - `extracted.title`
-  - `extracted.headings` (list of {tag, text})
-  - `extracted.text`
-  - Optional: `fear_score`, `is_change`, `date_iso`, `original_url`, `wayback_url`
-
-This matches the structure emitted by your upgraded `fsb_wayback_scraper.py`
-and (optionally) your narrative diff script.
-
-## Install dependencies
-
+## Setup
 ```bash
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## 1. Build the index
-
-Example:
-
+## Run It
 ```bash
-python fsb_build_index.py \
-  --input-jsonl data/fsb_snapshots_diff.jsonl \
-  --index-out data/fsb_faiss.index \
-  --meta-out data/fsb_meta.jsonl \
-  --model-name sentence-transformers/all-mpnet-base-v2
+python fsb_rag_cli.py --meta data/meta.jsonl --manifest data/manifest.jsonl --mock-llm
 ```
+- `--mock-llm` prints stitched snippets so you can run offline.
+- Drop the flag when you wire your own model. Until then the CLI just refuses with `LLM disabled`.
+- Defaults for `--meta`, `--manifest`, and `--top-k` live in `fsb_wayback/config.yaml` and can be overridden with `FSB_METADATA`, `FSB_MANIFEST`, or `FSB_TOP_K` environment variables.
 
-## 2. Run the RAG CLI
+The prompt loop prints answers, masks sources unless you ask for them, and refuses if provenance fails or the two toy indexes disagree.
 
-The CLI expects an OpenAI-compatible API. Set your key:
-
-```bash
-export OPENAI_API_KEY="sk-..."
-```
-
-Then:
-
-```bash
-python fsb_rag_cli.py \
-  --index data/fsb_faiss.index \
-  --meta data/fsb_meta.jsonl \
-  --model-name sentence-transformers/all-mpnet-base-v2 \
-  --openai-model gpt-4o-mini
-```
-
-You’ll drop into an interactive shell. Example queries:
-
-- `How did FSB's language about extremism and terrorism change between 2000 and 2014?`
-- `Summarise changes to counter-terrorism narratives around the 2014 Crimea annexation.`
-- `Which entities are repeatedly framed as external enemies in these snapshots?`
-
-Type `:q` or `:quit` to exit.
-
-## Notes
-
-- This is deliberately simple and transparent:
-  - FAISS for ANN search
-  - SentenceTransformers for embeddings
-  - OpenAI (or any OpenAI-compatible endpoint) for the LLM
-- You can swap the embedding or LLM backend by editing the scripts,
-  as long as you preserve the interface:
-  - `embed(text: str) -> np.ndarray`
-  - `llm_qa(context: str, question: str) -> str`
-
-Use this as a baseline and harden / expand it as you need.
-
-### Refusal Policy
-- **Insufficient consensus** (index overlap < τ): refuse with short message.
-- **Provenance mismatch** (hash/manifest fail): refuse; log incident.
-- **Exfil intent** (canary trigger, repeated near-dups): refuse; rate-limit client.
-
-### Disclosure Policy
-- Default: snippet-only (“archival snippet”).  
-- `--reveal-sources`: allowed for auditors only; CI blocks in production images.
+## Audits
+Need proof you ran it? Add `--audit` and we dump `audit_report.json` with the active knobs, the latest manifest entry, and the raw overlap trace. No dashboards, no jargon.
