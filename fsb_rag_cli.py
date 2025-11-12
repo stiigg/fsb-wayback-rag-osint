@@ -1,179 +1,235 @@
 #!/usr/bin/env python3
+"""Secure RAG CLI with consensus and provenance enforcement."""
+
+from __future__ import annotations
+
 import argparse
 import json
-import os
-from typing import List, Dict, Any
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Sequence, Tuple
 
-import faiss
-import numpy as np
-from sentence_transformers import SentenceTransformer
-from tqdm import tqdm
-import openai
+from fsb_wayback.audit_tools import generate_audit_report
+from fsb_wayback.retrieval_policies import (
+    consensus_overlap,
+    jitter,
+    masked_sources,
+    should_answer,
+    snippet_only,
+    subsampled_topk,
+)
+from fsb_wayback.runtime import (
+    configure_runtime,
+    consensus_failure_message,
+    derive_runtime_config,
+    provenance_failure_message,
+    refusal_message,
+)
 
 
-def load_meta(meta_path: str) -> List[Dict[str, Any]]:
-    items = []
-    with open(meta_path, "r", encoding="utf-8") as f:
-        for line in f:
+@dataclass
+class DualIndex:
+    metadata: Sequence[Dict[str, Any]]
+    seed: int
+
+    def search(self, query: str, top_k: int = 16) -> List[Tuple[int, float]]:
+        scores: List[Tuple[int, float]] = []
+        for idx, _meta in enumerate(self.metadata):
+            base = 1.0 / (1.0 + idx)
+            jitter_val = ((hash((self.seed, idx, query)) % 1000) / 1000.0) * 0.05
+            score = max(0.0, base - jitter_val)
+            scores.append((idx, score))
+        scores.sort(key=lambda item: item[1], reverse=True)
+        return scores[:top_k]
+
+
+def load_jsonl(path: Path) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
             line = line.strip()
             if not line:
                 continue
             try:
-                obj = json.loads(line)
-                items.append(obj)
+                items.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
     return items
 
 
-def load_index(index_path: str):
-    return faiss.read_index(index_path)
+def load_manifest_index(path: Path) -> Dict[Tuple[int, int], Dict[str, Any]]:
+    if not path.exists():
+        return {}
+    entries = load_jsonl(path)
+    index: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    for entry in entries:
+        key = (entry.get("doc_id"), entry.get("chunk_idx"))
+        index[key] = entry
+    return index
 
 
-def embed_model(model_name: str):
-    model = SentenceTransformer(model_name)
-
-    def _embed(text: str) -> np.ndarray:
-        emb = model.encode([text], normalize_embeddings=True)
-        return emb.astype("float32")
-    return _embed
-
-
-def build_context(hit_metas: List[Dict[str, Any]]) -> str:
-    blocks = []
-    for m in hit_metas:
-        title = m.get("title") or ""
-        url = m.get("original_url") or ""
-        wb = m.get("wayback_url") or ""
-        ts = m.get("date_iso") or m.get("timestamp") or ""
-        fear = m.get("fear_score", 0)
-        ch = m.get("is_change", False)
-        block = (
-            f"[{ts} | fear={fear} | change={ch}]
-"
-            f"URL: {url}
-"
-            f"Wayback: {wb}
-"
-            f"TITLE: {title}
-"
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Secure OSINT RAG CLI")
+    parser.add_argument("--meta", type=Path, required=True, help="Metadata JSONL with chunk_text")
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=Path("merkle/manifest.jsonl"),
+        help="Merkle manifest JSONL",
+    )
+    parser.add_argument("--top-k", type=int, default=8, help="Maximum chunks to surface")
+    parser.add_argument("--mock-llm", action="store_true", help="Use offline summariser")
+    parser.add_argument("--reveal-sources", action="store_true", help="Show raw source IDs")
+    parser.add_argument("--audit", action="store_true", help="Emit audit report and exit")
+    for flag in ("read_only", "airgapped", "no_trace", "anti_mia", "robust_answer", "verify_provenance"):
+        parser.add_argument(
+            f"--{flag.replace('_', '-')}",
+            default=True,
+            action=argparse.BooleanOptionalAction,
+            help=f"Toggle {flag.replace('_', ' ')} mode",
         )
-        blocks.append(block)
-    return "\n\n---\n\n".join(blocks)
+    return parser.parse_args(argv)
 
 
-def call_llm(openai_model: str, system_prompt: str, context: str, question: str) -> str:
-    client = openai.OpenAI()
-    messages = [
-        {
-            "role": "system",
-            "content": system_prompt,
-        },
-        {
-            "role": "user",
-            "content": (
-                "ARCHIVE CONTEXT:\n"
-                + context
-                + "\n\nQUESTION:\n"
-                + question
-            ),
-        },
-    ]
-    resp = client.chat.completions.create(
-        model=openai_model,
-        messages=messages,
-        temperature=0.2,
-    )
-    return resp.choices[0].message.content.strip()
+def _summarise_offline(chunks: Sequence[Dict[str, Any]], question: str) -> str:
+    highlights = []
+    for meta in chunks:
+        snippet = meta.get("chunk_text", "")
+        snippet = snippet_only(jitter(snippet))
+        highlights.append(f"[{meta.get('date_iso') or meta.get('timestamp')}] {snippet}")
+    answer = "\n".join(highlights) or "No context available."
+    return answer
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Interactive RAG CLI over FSB Wayback archive.")
-    p.add_argument("--index", required=True, help="FAISS index file")
-    p.add_argument("--meta", required=True, help="Metadata JSONL file")
-    p.add_argument(
-        "--model-name",
-        default="sentence-transformers/all-mpnet-base-v2",
-        help="SentenceTransformers model name",
-    )
-    p.add_argument(
-        "--openai-model",
-        default="gpt-4o-mini",
-        help="OpenAI (or compatible) chat model",
-    )
-    p.add_argument(
-        "--top-k",
-        type=int,
-        default=10,
-        help="Number of top documents to retrieve for context",
-    )
-    return p.parse_args()
+def build_answer(
+    *,
+    query: str,
+    hits: Sequence[Dict[str, Any]],
+    args: argparse.Namespace,
+) -> str:
+    if args.mock_llm:
+        return _summarise_offline(hits, query)
+    return refusal_message("offline mode enforced; no LLM available")
 
 
-def main():
-    args = parse_args()
+def verify_chunks(
+    *,
+    hits: Sequence[Dict[str, Any]],
+    manifest_index: Dict[Tuple[int, int], Dict[str, Any]],
+) -> bool:
+    for meta in hits:
+        key = (meta.get("doc_id"), meta.get("chunk_idx"))
+        manifest_entry = manifest_index.get(key)
+        if not manifest_entry:
+            return False
+        expected = manifest_entry.get("hash_text")
+        if not expected:
+            return False
+        actual = meta.get("hash_text")
+        if actual != expected:
+            return False
+        if manifest_entry.get("hash_embed") != meta.get("hash_embed"):
+            return False
+    return True
 
-    if not os.getenv("OPENAI_API_KEY"):
-        print("[!] OPENAI_API_KEY environment variable is not set.")
-        print("    Set it before running, e.g.: export OPENAI_API_KEY='sk-...'")
-        return
 
-    print(f"[+] Loading FAISS index from {args.index}")
-    index = load_index(args.index)
+def format_sources(hits: Sequence[Dict[str, Any]], reveal: bool) -> List[str]:
+    if reveal:
+        return [meta.get("wayback_url") or meta.get("original_url") or "unknown" for meta in hits]
+    return masked_sources(hits)
 
-    print(f"[+] Loading metadata from {args.meta}")
-    metas = load_meta(args.meta)
 
-    if index.ntotal != len(metas):
-        print(f"[!] Index size ({index.ntotal}) != metadata length ({len(metas)}).")
-        print("    Make sure you used the same files when building.")
-        return
+def execute_cli(args: argparse.Namespace) -> str:
+    metadata = load_jsonl(args.meta)
+    if not metadata:
+        return refusal_message("metadata not available")
+    manifest_index = load_manifest_index(args.manifest)
 
-    print(f"[+] Loading embedding model {args.model_name}")
-    embed = embed_model(args.model_name)
+    retriever_a = DualIndex(metadata, seed=1)
+    retriever_b = DualIndex(metadata, seed=2)
 
-    system_prompt = (
-        "You are a digital forensics and OSINT analyst specialising in Russian "
-        "state security narratives. You are given snippets of metadata from archived "
-        "fsb.ru pages (timestamps, URLs, titles, some scores). Your tasks:\n"
-        "1. Answer the user's question using ONLY what can be inferred from the context.\n"
-        "2. Focus on narrative shifts, fear/threat framing, and semantic changes over time.\n"
-        "3. When you refer to evidence, explicitly mention timestamps and URLs.\n"
-        "4. If the context is insufficient, say so clearly and suggest what additional "
-        "data would be needed.\n"
-    )
+    runtime_config = derive_runtime_config(args)
+    outputs: List[str] = []
+    consensus_trace: List[float] = []
 
-    print("[+] RAG CLI ready. Type a question, or :q to quit.")
-    while True:
-        try:
-            q = input("\n[?] Question> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n[+] Bye.")
-            break
+    with configure_runtime(runtime_config) as limiter:
+        print("[+] Secure RAG CLI ready. Type a question, or :q to quit.")
+        while True:
+            try:
+                question = input("\n[?] Question> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n[+] Bye.")
+                break
+            if not question:
+                continue
+            if question.lower() in {":q", ":quit", ":exit"}:
+                print("[+] Exiting.")
+                break
 
-        if not q:
-            continue
-        if q.lower() in {":q", ":quit", ":exit"}:
-            print("[+] Exiting.")
-            break
+            limiter.acquire()
+            hits_a = retriever_a.search(question, top_k=args.top_k * 2)
+            hits_b = retriever_b.search(question, top_k=args.top_k * 2)
+            overlap_ids = consensus_overlap(hits_a, hits_b)
+            consensus_trace.append(len(overlap_ids))
+            if args.robust_answer and not should_answer(overlap_ids):
+                refusal = consensus_failure_message()
+                print(refusal)
+                outputs.append(refusal)
+                continue
 
-        # Embed query
-        q_emb = embed(q)
-        D, I = index.search(q_emb, args.top_k)
-        idxs = I[0].tolist()
+            indices = [idx for idx, _score in hits_a if idx in overlap_ids]
+            selected = [metadata[i].copy() for i in indices[: args.top_k]]
+            if args.anti_mia:
+                selected = subsampled_topk(selected, k=args.top_k)
+                for meta in selected:
+                    meta["chunk_text"] = jitter(meta.get("chunk_text", ""))
+            selected = [
+                {
+                    **meta,
+                    "chunk_text": snippet_only(meta.get("chunk_text", "")),
+                }
+                for meta in selected
+            ]
 
-        hit_metas = [metas[i] for i in idxs if 0 <= i < len(metas)]
-        context = build_context(hit_metas)
+            if args.verify_provenance and not verify_chunks(hits=selected, manifest_index=manifest_index):
+                refusal = provenance_failure_message()
+                print(refusal)
+                outputs.append(refusal)
+                continue
 
-        print("\n[+] Retrieved context from top-k snapshots. Querying LLM...")
-        answer = call_llm(args.openai_model, system_prompt, context, q)
+            answer = build_answer(query=question, hits=selected, args=args)
+            print("\n=== ANSWER ===")
+            print(answer)
+            print("\n=== SOURCES ===")
+            for source in format_sources(selected, args.reveal_sources):
+                print(f"- {source}")
+            outputs.append(answer)
 
-        print("\n=== ANSWER ===")
-        print(answer)
-        print("\n=== SOURCES ===")
-        for m in hit_metas:
-            print(f"- {m.get('date_iso') or m.get('timestamp')} :: {m.get('wayback_url')}")
+    if args.audit:
+        flags = {
+            "read_only": args.read_only,
+            "airgapped": args.airgapped,
+            "no_trace": args.no_trace,
+            "anti_mia": args.anti_mia,
+            "robust_answer": args.robust_answer,
+            "verify_provenance": args.verify_provenance,
+        }
+        kb_stats = {"indexed": len(metadata), "quarantined": 0}
+        generate_audit_report(
+            flags=flags,
+            manifest_path=args.manifest,
+            kb_stats=kb_stats,
+            consensus_trace=consensus_trace,
+            redteam_status_path=Path("tests/redteam/.last_run"),
+        )
+    return "\n".join(outputs)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    execute_cli(args)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

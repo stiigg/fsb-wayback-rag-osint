@@ -7,20 +7,149 @@ import argparse
 import hashlib
 import json
 import logging
+import random
 import re
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
+import yaml
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 PHONE_RE = re.compile(r"\+?\d[\d\s\-()]{6,}\d")
+
+
+class ExtractedPayload(BaseModel):
+    title: Optional[str] = None
+    text: str = Field(default="", min_length=1)
+    headings: Optional[List[Dict[str, Any]]] = None
+
+    model_config = {"extra": "allow"}
+
+    @field_validator("text")
+    @classmethod
+    def trim_text(cls, value: str) -> str:
+        return value.strip()
+
+
+class SnapshotRecord(BaseModel):
+    original_url: str = Field(default="")
+    wayback_url: Optional[str] = None
+    timestamp: Optional[str] = None
+    date_iso: Optional[str] = None
+    extracted: ExtractedPayload
+    language: Optional[str] = Field(default=None, alias="lang")
+
+    model_config = {"extra": "allow", "populate_by_name": True}
+
+    @field_validator("original_url")
+    @classmethod
+    def require_url(cls, value: str) -> str:
+        return value.strip()
+
+
+class IngestPolicy(BaseModel):
+    allowed_url_regex: List[str]
+    date_window: Dict[str, str]
+    sha256_allowlist: List[str]
+    min_chars: int
+    max_boilerplate_pct: float
+    lang_allowlist: List[str]
+    dedup: Dict[str, Any]
+    entity_outlier: Dict[str, Any]
+    quarantine_bucket: str
+
+    model_config = {"extra": "allow"}
+
+
+def load_ingest_policy(policy_path: Path) -> IngestPolicy:
+    raw = yaml.safe_load(policy_path.read_text(encoding="utf-8"))
+    return IngestPolicy.model_validate(raw)
+
+
+def _matches_regex(patterns: List[str], value: str) -> bool:
+    return any(re.compile(p).search(value) for p in patterns)
+
+
+def _parse_date(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y%m%d%H%M%S", "%Y%m%d"):
+        try:
+            return datetime.strptime(value[: len(fmt)], fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _estimate_lang(text: str) -> str:
+    cyrillic = sum(1 for ch in text if "\u0400" <= ch <= "\u04FF")
+    latin = sum(1 for ch in text if "A" <= ch <= "z")
+    if cyrillic > latin:
+        return "ru"
+    return "en"
+
+
+def _boilerplate_ratio(text: str) -> float:
+    words = [w.lower() for w in re.findall(r"\w+", text)]
+    if not words:
+        return 1.0
+    unique = len(set(words))
+    return 1 - (unique / len(words))
+
+
+def enforce_policy(
+    record: SnapshotRecord,
+    policy: IngestPolicy,
+    seen_hashes: Dict[str, str],
+) -> Optional[str]:
+    url = record.original_url
+    if not url or not _matches_regex(policy.allowed_url_regex, url):
+        return "url_out_of_scope"
+
+    window = policy.date_window
+    since = _parse_date(window.get("since"))
+    until = _parse_date(window.get("until"))
+    stamp = _parse_date(record.date_iso or record.timestamp)
+    if stamp is None or (since and stamp < since) or (until and stamp > until):
+        return "timestamp_out_of_scope"
+
+    text = record.extracted.text
+    if len(text) < policy.min_chars:
+        return "too_short"
+
+    if _boilerplate_ratio(text) > policy.max_boilerplate_pct:
+        return "too_boilerplate"
+
+    lang = record.language or _estimate_lang(text)
+    if policy.lang_allowlist and lang.lower() not in {code.lower() for code in policy.lang_allowlist}:
+        return "lang_not_allowed"
+
+    sha_prefix = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if policy.sha256_allowlist and sha_prefix not in policy.sha256_allowlist:
+        return "hash_not_allowlisted"
+
+    dedup_key = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    if dedup_key in seen_hashes:
+        return "duplicate_content"
+    seen_hashes[dedup_key] = url
+
+    return None
+
+
+def quarantine_record(record: Dict[str, Any], quarantine_dir: Path, reason: str) -> None:
+    quarantine_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"record": record, "reason": reason}
+    path = quarantine_dir / f"quarantine_{int(time.time()*1000)}_{random.randint(0, 9999):04d}.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,6 +213,12 @@ def parse_args() -> argparse.Namespace:
         "--log-level",
         default="INFO",
         help="Python logging level (e.g. INFO, DEBUG)",
+    )
+    parser.add_argument(
+        "--policy",
+        type=Path,
+        default=Path("fsb_wayback/ingest_policy.yaml"),
+        help="Path to zero-trust ingest policy",
     )
     return parser.parse_args()
 
@@ -152,13 +287,16 @@ def sanitize_record(record: Dict[str, Any], redact_pii: bool) -> Dict[str, Any]:
 
 def load_records(
     input_path: Path,
-    min_chars: int,
+    policy: IngestPolicy,
     sanitize: bool,
     redact_pii: bool,
     bad_out,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    total = malformed = too_short = sanitized_count = 0
+    total = malformed = sanitized_count = 0
+    policy_failures: Dict[str, int] = {}
     records: List[Dict[str, Any]] = []
+    seen_hashes: Dict[str, str] = {}
+    quarantine_dir = Path(policy.quarantine_bucket)
     for raw_line in input_path.open("r", encoding="utf-8"):
         total += 1
         line = raw_line.strip()
@@ -175,25 +313,33 @@ def load_records(
             sanitize_record(obj, redact_pii=redact_pii)
             sanitized_count += 1
 
-        body_text = extract_body_text(obj)
-        if body_text is None or len(body_text.strip()) < min_chars:
-            too_short += 1
-            bad_out.write(json.dumps({"record": obj, "error": "too_short_body"}, ensure_ascii=False) + "\n")
+        try:
+            record_model = SnapshotRecord.model_validate(obj)
+        except ValidationError as exc:
+            reason = "schema_validation_failed"
+            policy_failures[reason] = policy_failures.get(reason, 0) + 1
+            quarantine_record({"record": obj, "error": exc.errors()}, quarantine_dir, reason)
             continue
 
-        records.append(obj)
+        failure = enforce_policy(record_model, policy, seen_hashes)
+        if failure:
+            policy_failures[failure] = policy_failures.get(failure, 0) + 1
+            quarantine_record(record_model.model_dump(mode="python"), quarantine_dir, failure)
+            continue
+
+        records.append(record_model.model_dump(mode="python"))
 
     stats = {
         "total_lines": total,
         "malformed": malformed,
-        "too_short": too_short,
+        "policy_failures": policy_failures,
         "sanitized": sanitized_count,
     }
     logging.info(
-        "Loaded %d records (malformed=%d, too_short=%d, sanitized=%d)",
+        "Loaded %d records (malformed=%d, policy_failures=%s, sanitized=%d)",
         len(records),
         malformed,
-        too_short,
+        policy_failures,
         sanitized_count,
     )
     return records, stats
@@ -344,6 +490,14 @@ def write_manifest(path: Path, manifest: Dict[str, Any]) -> None:
     logging.info("Wrote manifest to %s", path)
 
 
+def append_merkle_manifest(entries: List[Dict[str, Any]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        for entry in entries:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    logging.info("Appended %d entries to %s", len(entries), path)
+
+
 def save_faiss_index(index: faiss.Index, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     faiss.write_index(index, str(path))
@@ -394,10 +548,13 @@ def main() -> int:
     if apply_sanitize:
         logging.info("Sanitization enabled (redact_pii=%s)", args.redact_pii)
 
+    policy = load_ingest_policy(args.policy)
+    logging.info("Loaded ingest policy from %s", args.policy)
+
     with open_error_log(args, output_paths) as bad_out:
         records, load_stats = load_records(
             args.input,
-            min_chars=args.min_chars,
+            policy=policy,
             sanitize=apply_sanitize,
             redact_pii=args.redact_pii,
             bad_out=bad_out,
@@ -405,6 +562,7 @@ def main() -> int:
 
     all_texts: List[str] = []
     metadata: List[Dict[str, Any]] = []
+    chunk_manifest_entries: List[Dict[str, Any]] = []
     valid_docs = 0
 
     for doc_idx, record in enumerate(records):
@@ -425,6 +583,23 @@ def main() -> int:
                     "timestamp": chunk.timestamp,
                     "date_iso": chunk.date_iso,
                     "title": chunk.title,
+                    "chunk_text": chunk.text,
+                    "hash_text": None,
+                    "hash_raw": None,
+                    "hash_embed": None,
+                }
+            )
+            raw_body = extract_body_text(record) or ""
+            chunk_manifest_entries.append(
+                {
+                    "doc_id": doc_idx,
+                    "chunk_idx": chunk.chunk_idx,
+                    "hash_raw": hashlib.sha256(raw_body.encode("utf-8")).hexdigest(),
+                    "hash_text": hashlib.sha256(chunk.text.encode("utf-8")).hexdigest(),
+                    "hash_embed": None,
+                    "source_url": chunk.url,
+                    "wayback_ts": chunk.timestamp or chunk.date_iso,
+                    "scraper_version": record.get("scraper_version", "unknown"),
                 }
             )
 
@@ -441,10 +616,20 @@ def main() -> int:
         device=args.device,
     )
 
+    for idx, vector in enumerate(embeddings):
+        chunk_manifest_entries[idx]["hash_embed"] = hashlib.sha256(vector.tobytes()).hexdigest()
+        metadata[idx]["hash_embed"] = chunk_manifest_entries[idx]["hash_embed"]
+        metadata[idx]["hash_text"] = chunk_manifest_entries[idx]["hash_text"]
+        metadata[idx]["hash_raw"] = chunk_manifest_entries[idx]["hash_raw"]
+
+    merkle_concat = "".join(entry["hash_embed"] for entry in chunk_manifest_entries)
+    merkle_root = hashlib.sha256(merkle_concat.encode("utf-8")).hexdigest()
+
     index = build_faiss_index(embeddings, args.index_type, args.nlist)
 
     save_faiss_index(index, output_paths["index"])
     write_metadata(metadata, output_paths["metadata"])
+    append_merkle_manifest(chunk_manifest_entries, Path("merkle/manifest.jsonl"))
 
     manifest = {
         "input_file": str(args.input),
@@ -466,6 +651,7 @@ def main() -> int:
         "device_requested": args.device,
         "device_used": resolved_device,
         "stats": load_stats,
+        "merkle_root": merkle_root,
         "duration_seconds": time.time() - start_time,
     }
     write_manifest(output_paths["manifest"], manifest)

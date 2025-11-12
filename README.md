@@ -78,3 +78,12 @@ Type `:q` or `:quit` to exit.
   - `llm_qa(context: str, question: str) -> str`
 
 Use this as a baseline and harden / expand it as you need.
+
+### Refusal Policy
+- **Insufficient consensus** (index overlap < τ): refuse with short message.
+- **Provenance mismatch** (hash/manifest fail): refuse; log incident.
+- **Exfil intent** (canary trigger, repeated near-dups): refuse; rate-limit client.
+
+### Disclosure Policy
+- Default: snippet-only (“archival snippet”).  
+- `--reveal-sources`: allowed for auditors only; CI blocks in production images.
