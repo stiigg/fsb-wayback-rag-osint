@@ -1,0 +1,9 @@
+allowed_url_regex: ["^https?://(web\\.archive\\.org|fsb\\.ru)/"]
+date_window: { since: "1998-01-01", until: "2025-12-31" }
+sha256_allowlist: []              # optional strict mode
+min_chars: 400
+max_boilerplate_pct: 0.45
+lang_allowlist: ["ru", "en"]
+dedup: { shingle: 5, jaccard_minhash_threshold: 0.85 }
+entity_outlier: { enabled: true, zscore_threshold: 3.0 }
+quarantine_bucket: "data/quarantine"
