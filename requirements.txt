@@ -4,3 +4,7 @@ sentence-transformers
 tqdm
 openai
 pyyaml
+requests
+trafilatura
+beautifulsoup4
+lxml

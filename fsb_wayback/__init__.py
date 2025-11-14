@@ -3,5 +3,6 @@
 __all__ = [
     "config",
     "retrieval",
+    "scraper",
     "utils",
 ]
